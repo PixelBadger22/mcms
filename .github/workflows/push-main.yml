@@ -1,0 +1,171 @@
+name: push-main
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  ci-lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - name: Linting Go
+        uses: smartcontractkit/.github/actions/ci-lint-go@ci-lint-go/v4
+        with:
+          golangci-lint-version: v2.12.2
+          use-go-cache: true
+          only-new-issues: false
+          golangci-lint-config: .golangci.yml
+
+  ci-lint-e2e:
+    name: Lint E2E tests
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - name: Linting Go
+        uses: smartcontractkit/.github/actions/ci-lint-go@ci-lint-go/v4
+        with:
+          golangci-lint-version: v2.12.2
+          golangci-lint-args: --build-tags="e2e"
+          use-go-cache: true
+          only-new-issues: false
+          golangci-lint-config: .golangci.yml
+
+  ci-lint-misc:
+    name: Lint GH Actions and scripts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Linting Misc (yaml + sh files)
+        uses: smartcontractkit/.github/actions/ci-lint-misc@ci-lint-misc/v1
+
+  ci-test:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - name: ci-test
+        uses: smartcontractkit/.github/actions/ci-test-go@ci-test-go/v1
+        with:
+          go-test-cmd: go test -coverprofile=coverage.txt $(go list ./...)
+          use-go-cache: true
+
+  ci-test-e2e:
+    name: Tests E2E
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - name: Install Rust
+        uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3 # v1.3.0
+
+      - name: Install Solana
+        uses: metaplex-foundation/actions/install-solana@2389940047edc63a5781911f6a53fbdf784748d8 # v1.0.4
+        with:
+          version: 1.18.26
+
+      - name: Install Aptos CLI
+        uses: aptos-labs/actions/install-aptos-cli@528ef7ad9427a8c0720ea3eea790a9190d6e377d # v0.1
+        with:
+          CLI_VERSION: 7.10.0
+
+      - name: Install Sui CLI
+        shell: bash
+        run: |
+          SUI_VERSION="1.72.2"
+          curl -L "https://github.com/MystenLabs/sui/releases/download/mainnet-v${SUI_VERSION}/sui-mainnet-v${SUI_VERSION}-ubuntu-x86_64.tgz" -o sui.tgz
+          tar -xzf sui.tgz
+          sudo mv sui /usr/local/bin/
+          sui --version
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Compute Solana programs cache key
+        id: solana-programs-cache-key
+        shell: bash
+        run: |
+          key="$(go list -m github.com/smartcontractkit/chainlink-ccip/chains/solana)"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Solana programs
+        uses: actions/cache@v5
+        id: cache-solana-programs
+        with:
+          path: ./e2e/artifacts/solana
+          key: "${{runner.os}}-mcms-contracts-${{steps.solana-programs-cache-key.outputs.key}}"
+
+      - name: Build Solana programs
+        if: steps.cache-solana-programs.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          ./e2e/tests/solana/compile-mcm-contracts.sh
+
+      - name: Run e2e tests
+        uses: smartcontractkit/.github/actions/ci-test-go@ci-test-go/v1
+        with:
+          checkout-repo: false
+          use-go-cache: true
+          go-test-cmd: |
+            set +e
+
+            echo "::group::EVM"
+            CTF_CONFIGS=../config.evm.toml go test -p=1 -tags=e2e -v ./e2e/tests/... -run=TestEVMSuite || evm_failure=true
+            echo "::endgroup::"
+
+            echo "::group::Solana"
+            CTF_CONFIGS=../config.solana.toml go test -p=1 -tags=e2e -v ./e2e/tests/... -run=TestSolanaSuite || solana_failure=true
+            echo "::endgroup::"
+
+            echo "::group::Aptos"
+            CTF_CONFIGS=../config.aptos.toml go test -p=1 -tags=e2e -v ./e2e/tests/... -run=TestAptosSuite || aptos_failure=true
+            echo "::endgroup::"
+
+            echo "::group::Sui"
+            CTF_CONFIGS=../config.sui.toml go test -p=1 -tags=e2e -v ./e2e/tests/... -run=TestSuiSuite || sui_failure=true
+            echo "::endgroup::"
+
+            [[ -n "${evm_failure}" ]] && echo "🚨 EVM e2e tests failed."
+            [[ -n "${solana_failure}" ]] && echo "🚨 Solana e2e tests failed."
+            [[ -n "${aptos_failure}" ]] && echo "🚨 Aptos e2e tests failed."
+            [[ -n "${sui_failure}" ]] && echo "🚨 Sui e2e tests failed."
+            [[ -n "${evm_failure}" || -n "${solana_failure}" || -n "${aptos_failure}" || -n "${sui_failure}" ]] && {
+              exit 1
+            } || {
+              echo "Exiting"
+              exit 0
+            }
+
+  ci-sonarqube:
+    name: Sonarqube Scan
+    runs-on: ubuntu-latest
+    needs: [ ci-lint, ci-lint-misc, ci-test ]
+    permissions:
+      contents: read
+      actions: read
+
+    if: github.actor != 'dependabot[bot]'
+    steps:
+      - name: Scanning with Sonarqube
+        uses: smartcontractkit/.github/actions/ci-sonarqube-go@82f9a1703246639b70da5fd5a3e489363b04a0d6 # v0.6.0
+        with:
+          # sonarqube inputs
+          sonar-token: ${{ secrets.SONAR_TOKEN }}
+          sonar-host-url: ${{ secrets.SONAR_HOST_URL }}
+          include-lint: true

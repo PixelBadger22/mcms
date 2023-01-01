@@ -1,0 +1,86 @@
+version: "3"
+
+tasks:
+  default:
+    desc: "Run the entire test suite"
+    cmds:
+      - task: unit
+      - task: e2e
+
+  unit:
+    desc: "Run unit tests"
+    cmds:
+      - go test {{.CLI_ARGS}} ./...
+
+  unit:sui:
+    desc: "Run Sui unit tests"
+    cmds:
+      - go test -v {{.CLI_ARGS}} ./sdk/sui/...
+
+  unit:ton:
+    desc: "Run TON unit tests"
+    cmds:
+      - go test -v {{.CLI_ARGS}} ./sdk/ton/...
+
+  e2e:
+    desc: "Run e2e tests"
+    env:
+      CTF_CONFIGS: '{{ .CTF_CONFIGS | default "../config.toml" }}'
+    cmds:
+      - CTF_CONFIGS=$CTF_CONFIGS go test -v -tags=e2e {{.CLI_ARGS}} ./e2e/tests...
+
+  e2e:evm:
+    desc: "Run EVM e2e tests"
+    env:
+      CTF_CONFIGS: '{{ .CTF_CONFIGS | default "../config.evm.toml" }}'
+    cmds:
+      - CTF_CONFIGS=$CTF_CONFIGS go test -v -tags=e2e -test.run TestEVMSuite {{.CLI_ARGS}} ./e2e/tests...
+
+  e2e:solana:
+    desc: "Run Solana e2e tests"
+    env:
+      CTF_CONFIGS: '{{ .CTF_CONFIGS | default "../config.solana.toml" }}'
+    cmds:
+      - CTF_CONFIGS=$CTF_CONFIGS go test -tags=e2e -test.run TestSuite {{.CLI_ARGS}} ./e2e/tests...
+
+  e2e:aptos:
+    desc: "Run Aptos e2e tests"
+    env:
+      CTF_CONFIGS: '{{ .CTF_CONFIGS | default "../config.aptos.toml" }}'
+    cmds:
+      - CTF_CONFIGS=$CTF_CONFIGS go test -tags=e2e -test.run TestAptosSuite {{.CLI_ARGS}} ./e2e/tests...
+
+  e2e:sui:
+    desc: "Run Sui e2e tests"
+    env:
+      CTF_CONFIGS: '{{ .CTF_CONFIGS | default "../config.sui.toml" }}'
+    cmds:
+      - CTF_CONFIGS=$CTF_CONFIGS go test -v -tags=e2e -test.run TestSuiSuite {{.CLI_ARGS}} ./e2e/tests...
+
+  e2e:ton:
+    desc: "Run Ton e2e tests"
+    env:
+      CTF_CONFIGS: '{{ .CTF_CONFIGS | default "../config.ton.toml" }}'
+    cmds:
+      - CTF_CONFIGS=$CTF_CONFIGS go test -v -tags=e2e -test.run TestTONSuite {{.CLI_ARGS}} ./e2e/tests...
+
+  e2e:canton:
+    desc: "Run Canton e2e tests"
+    env:
+      CTF_CONFIGS: '{{ .CTF_CONFIGS | default "../config.canton.toml" }}'
+    cmds:
+      - CTF_CONFIGS=$CTF_CONFIGS go test -v -tags=e2e -test.run TestCantonSuite {{.CLI_ARGS}} ./e2e/tests...
+
+  coverage:
+    desc: "Run unit test suite with coverage"
+    cmds:
+      - go test -coverprofile=coverage.out -covermode count ./...
+      - go tool cover -html=coverage.out
+
+  ledger:
+    desc: "Run ledger signing test"
+    env:
+      RUN_LEDGER_SUITE: true
+      CTF_CONFIGS: '{{ .CTF_CONFIGS | default "../config.toml" }}'
+    cmds:
+      - go test -tags=e2e -v {{.CLI_ARGS}} ./e2e/ledger

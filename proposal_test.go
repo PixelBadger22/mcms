@@ -1,0 +1,1365 @@
+package mcms
+
+import (
+	"crypto/ecdsa"
+	"encoding/json"
+	"errors"
+	"io"
+	"math"
+	"math/big"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/Masterminds/semver/v3"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/go-playground/validator/v10"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/mcms/internal/testutils/chaintest"
+	"github.com/smartcontractkit/mcms/sdk"
+	"github.com/smartcontractkit/mcms/sdk/evm"
+	"github.com/smartcontractkit/mcms/sdk/evm/bindings"
+	"github.com/smartcontractkit/mcms/sdk/mocks"
+	"github.com/smartcontractkit/mcms/types"
+)
+
+var (
+	TestAddress   = "0x1234567890abcdef"
+	ValidProposal = `{
+		"version": "v1",
+		"kind": "Proposal",
+		"validUntil": 2004259681,
+		"chainMetadata": {
+			"3379446385462418246": {
+				"startingOpCount": 0,
+				"mcmAddress": ""
+			}
+		},
+		"operations": [
+			{
+				"chainSelector": 3379446385462418246,
+				"transaction": {
+					"to": "0xsomeaddress",
+					"data": "EjM=",
+					"additionalFields": {"value": 0}
+				}
+			}
+		]
+	}`
+)
+
+func TestBaseProposal_AppendSignature(t *testing.T) {
+	t.Parallel()
+
+	signature := types.Signature{}
+
+	proposal := BaseProposal{}
+
+	assert.Empty(t, proposal.Signatures)
+
+	proposal.AppendSignature(signature)
+
+	assert.Equal(t, []types.Signature{signature}, proposal.Signatures)
+}
+
+func TestBaseProposal_ChainMetadatas(t *testing.T) {
+	t.Parallel()
+
+	chainMetadata := map[types.ChainSelector]types.ChainMetadata{
+		chaintest.Chain1Selector: {},
+	}
+
+	proposal := BaseProposal{
+		ChainMetadata: chainMetadata,
+	}
+
+	assert.Equal(t, chainMetadata, proposal.ChainMetadatas())
+}
+
+func TestBaseProposal_SetChainMetadata(t *testing.T) {
+	t.Parallel()
+
+	proposal := BaseProposal{
+		ChainMetadata: map[types.ChainSelector]types.ChainMetadata{},
+	}
+
+	md, ok := proposal.ChainMetadata[chaintest.Chain1Selector]
+	assert.False(t, ok)
+	assert.Empty(t, md)
+
+	proposal.setChainMetadata(chaintest.Chain1Selector, types.ChainMetadata{
+		StartingOpCount: 0,
+		MCMAddress:      "",
+	})
+
+	assert.Equal(t, uint64(0), proposal.ChainMetadata[chaintest.Chain1Selector].StartingOpCount)
+	assert.Empty(t, proposal.ChainMetadata[chaintest.Chain1Selector].MCMAddress)
+}
+
+func TestNewProposal(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		give             string
+		givePredecessors []string
+		want             Proposal
+		wantErr          string
+	}{
+		{
+			name:             "success: initializes a proposal from an io.Reader",
+			give:             ValidProposal,
+			givePredecessors: []string{},
+			want: Proposal{
+				BaseProposal: BaseProposal{
+					Version:    "v1",
+					Kind:       types.KindProposal,
+					ValidUntil: 2004259681,
+					ChainMetadata: map[types.ChainSelector]types.ChainMetadata{
+						chaintest.Chain1Selector: {},
+					},
+				},
+				Operations: []types.Operation{
+					{
+						ChainSelector: chaintest.Chain1Selector,
+						Transaction: types.Transaction{
+							To:               "0xsomeaddress",
+							Data:             []byte{0x12, 0x33},              // Representing "0x123" as bytes
+							AdditionalFields: json.RawMessage(`{"value": 0}`), // JSON-encoded `{"value": 0}`
+						},
+					},
+				},
+			},
+		},
+		{
+			name:             "success: initializes a proposal with 1 predecessor proposals",
+			give:             ValidProposal,
+			givePredecessors: []string{ValidProposal},
+			want: Proposal{
+				BaseProposal: BaseProposal{
+					Version:    "v1",
+					Kind:       types.KindProposal,
+					ValidUntil: 2004259681,
+					ChainMetadata: map[types.ChainSelector]types.ChainMetadata{
+						chaintest.Chain1Selector: {
+							StartingOpCount: 1,
+							MCMAddress:      "",
+						},
+					},
+				},
+				Operations: []types.Operation{
+					{
+						ChainSelector: chaintest.Chain1Selector,
+						Transaction: types.Transaction{
+							To:               "0xsomeaddress",
+							Data:             []byte{0x12, 0x33},              // Representing "0x123" as bytes
+							AdditionalFields: json.RawMessage(`{"value": 0}`), // JSON-encoded `{"value": 0}`
+						},
+					},
+				},
+			},
+		},
+		{
+			name:             "success: initializes a proposal with 2 predecessor proposals",
+			give:             ValidProposal,
+			givePredecessors: []string{ValidProposal, ValidProposal},
+			want: Proposal{
+				BaseProposal: BaseProposal{
+					Version:    "v1",
+					Kind:       types.KindProposal,
+					ValidUntil: 2004259681,
+					ChainMetadata: map[types.ChainSelector]types.ChainMetadata{
+						chaintest.Chain1Selector: {
+							StartingOpCount: 2,
+							MCMAddress:      "",
+						},
+					},
+				},
+				Operations: []types.Operation{
+					{
+						ChainSelector: chaintest.Chain1Selector,
+						Transaction: types.Transaction{
+							To:               "0xsomeaddress",
+							Data:             []byte{0x12, 0x33},              // Representing "0x123" as bytes
+							AdditionalFields: json.RawMessage(`{"value": 0}`), // JSON-encoded `{"value": 0}`
+						},
+					},
+				},
+			},
+		},
+		{
+			name:             "failure: could not unmarshal JSON",
+			give:             `invalid`,
+			givePredecessors: []string{},
+			wantErr:          "failed to decode and validate target proposal: failed to decode proposal: invalid character 'i' looking for beginning of value",
+		},
+		{
+			name: "failure: invalid proposal",
+			give: `{
+				"version": "v1",
+				"kind": "Proposal",
+				"validUntil": 2004259681,
+				"chainMetadata": {},
+				"operations": []
+			}`,
+			givePredecessors: []string{},
+			wantErr:          "failed to decode and validate target proposal: failed to validate proposal: Key: 'Proposal.BaseProposal.ChainMetadata' Error:Field validation for 'ChainMetadata' failed on the 'min' tag\nKey: 'Proposal.Operations' Error:Field validation for 'Operations' failed on the 'min' tag",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			give := strings.NewReader(tt.give)
+			givePredecessors := []io.Reader{}
+			for _, p := range tt.givePredecessors {
+				givePredecessors = append(givePredecessors, strings.NewReader(p))
+			}
+
+			fileProposal, err := NewProposal(give, WithPredecessors(givePredecessors))
+
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, *fileProposal)
+			}
+		})
+	}
+}
+
+func TestWriteProposal(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		giveWriter func() io.Writer // Use this to overwrite the default writer
+		op         types.Operation
+		want       string
+		wantErr    string
+	}{
+		{
+			name: "success: minimal proposal",
+			op: types.Operation{
+				ChainSelector: chaintest.Chain1Selector,
+				Transaction: types.Transaction{
+					To:               "0x123",
+					AdditionalFields: json.RawMessage(`{"value": 0}`),
+					Data:             common.Hex2Bytes("0x1"),
+				},
+			},
+			want: `{
+				"version": "v1",
+				"kind": "Proposal",
+				"description": "",
+				"validUntil": 2004259681,
+				"overridePreviousRoot": false,
+				"signatures": null,
+				"chainMetadata": {
+					"3379446385462418246": {
+						"mcmAddress": "",
+						"startingOpCount": 0
+					}
+				},
+				"operations": [
+					{
+						"chainSelector": 3379446385462418246,
+						"transaction": {
+							"to": "0x123",
+							"additionalFields": {"value": 0},
+							"data": "",
+							"tags": null,
+							"contractType": ""
+						}
+					}
+				]
+			}`,
+		},
+		{
+			name: "success: maximal proposal",
+			op: types.Operation{
+				ChainSelector: chaintest.Chain1Selector,
+				Transaction: types.Transaction{
+					To:               "0x123",
+					AdditionalFields: json.RawMessage(`{"value": 0}`),
+					Data:             common.Hex2Bytes("0x1"),
+					OperationMetadata: types.OperationMetadata{
+						ContractType:    "RBACTimelock",
+						ContractVersion: semver.MustParse("1.2.3"),
+						Tags:            []string{"tag1", "tag2"},
+					},
+				},
+			},
+			want: `{
+				"version": "v1",
+				"kind": "Proposal",
+				"description": "",
+				"validUntil": 2004259681,
+				"overridePreviousRoot": false,
+				"signatures": null,
+				"chainMetadata": {
+					"3379446385462418246": {
+						"mcmAddress": "",
+						"startingOpCount": 0
+					}
+				},
+				"operations": [
+					{
+						"chainSelector": 3379446385462418246,
+						"transaction": {
+							"to": "0x123",
+							"additionalFields": {"value": 0},
+							"data": "",
+							"contractType": "RBACTimelock",
+							"contractVersion": "1.2.3",
+							"tags": ["tag1", "tag2"]
+						}
+					}
+				]
+			}`,
+		},
+		{
+			name: "failure: writer returns error",
+			op: types.Operation{
+				ChainSelector: chaintest.Chain1Selector,
+				Transaction: types.Transaction{
+					To:               "0x123",
+					AdditionalFields: json.RawMessage(`{"value": 0}`),
+					Data:             common.Hex2Bytes("0x1"),
+				},
+			},
+			giveWriter: func() io.Writer {
+				return newFakeWriter(0, errors.New("write error"))
+			},
+			wantErr: "write error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			builder := NewProposalBuilder()
+			builder.SetVersion("v1").
+				SetValidUntil(2004259681).
+				AddChainMetadata(chaintest.Chain1Selector, types.ChainMetadata{}).
+				AddOperation(tt.op)
+
+			give, err := builder.Build()
+			require.NoError(t, err)
+
+			var w io.Writer
+			b := new(strings.Builder)
+
+			if tt.giveWriter != nil {
+				w = tt.giveWriter()
+			} else {
+				w = b
+			}
+
+			err = WriteProposal(w, give)
+
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				assert.JSONEq(t, tt.want, b.String())
+			}
+		})
+	}
+}
+
+func TestLoadProposal(t *testing.T) {
+	t.Parallel()
+	t.Run("valid file path with KindProposal", func(t *testing.T) {
+		t.Parallel()
+
+		tempFile, err := os.CreateTemp("", "valid_proposal.txt")
+		require.NoError(t, err)
+
+		err = os.WriteFile(tempFile.Name(), []byte(ValidProposal), 0600)
+		require.NoError(t, err)
+		defer os.Remove(tempFile.Name())
+
+		proposal, err := LoadProposal(types.KindProposal, tempFile.Name())
+
+		require.NoError(t, err)
+		assert.NotNil(t, proposal)
+	})
+
+	t.Run("valid file path with KindTimelockProposal", func(t *testing.T) {
+		t.Parallel()
+
+		tempFile, err := os.CreateTemp("", "valid_timelock_proposal.txt")
+		require.NoError(t, err)
+
+		err = os.WriteFile(tempFile.Name(), []byte(ValidTimelockProposal), 0600)
+		require.NoError(t, err)
+		defer os.Remove(tempFile.Name())
+
+		proposal, err := LoadProposal(types.KindTimelockProposal, tempFile.Name())
+
+		require.NoError(t, err)
+		assert.NotNil(t, proposal)
+	})
+
+	t.Run("unknown proposal type", func(t *testing.T) {
+		t.Parallel()
+
+		filePath := "testdata/valid_proposal.txt"
+		err := os.WriteFile(filePath, []byte(ValidProposal), 0600)
+		require.Error(t, err)
+		defer os.Remove(filePath)
+
+		proposal, err := LoadProposal(types.ProposalKind("unknown"), filePath)
+
+		require.Error(t, err)
+		assert.Nil(t, proposal)
+		assert.Equal(t, "unknown proposal type", err.Error())
+	})
+
+	t.Run("invalid file path", func(t *testing.T) {
+		t.Parallel()
+
+		filePath := "invalid_path.txt"
+
+		proposal, err := LoadProposal(types.KindProposal, filePath)
+
+		require.Error(t, err)
+		assert.Nil(t, proposal)
+	})
+}
+
+func TestProposalKindFromJSON(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		give    string
+		want    types.ProposalKind
+		wantErr string
+	}{
+		{
+			name: "success: Proposal kind",
+			give: `{"kind": "Proposal"}`,
+			want: types.KindProposal,
+		},
+		{
+			name: "success: TimelockProposal kind",
+			give: `{"kind": "TimelockProposal"}`,
+			want: types.KindTimelockProposal,
+		},
+		{
+			name:    "error: missing kind field",
+			give:    `{"version": "v1"}`,
+			wantErr: "proposal JSON missing required 'kind' field",
+		},
+		{
+			name:    "error: unknown kind",
+			give:    `{"kind": "UnknownKind"}`,
+			wantErr: `unknown proposal kind: "UnknownKind"`,
+		},
+		{
+			name:    "error: invalid JSON",
+			give:    `not json`,
+			wantErr: "failed to parse proposal JSON:",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := ProposalKindFromJSON(strings.NewReader(tt.give))
+
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+// This is just a convenience wrapper around TestProposalKindFromJSON to test the string version,
+// so we don't need to duplicate the tests, just cover the basic cases.
+func TestProposalKindFromJSONString(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		give    string
+		want    types.ProposalKind
+		wantErr string
+	}{
+		{
+			name: "success",
+			give: `{"kind": "Proposal"}`,
+			want: types.KindProposal,
+		},
+		{
+			name:    "error",
+			give:    `{"version": "v1"}`,
+			wantErr: "proposal JSON missing required 'kind' field",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := ProposalKindFromJSONString(tt.give)
+
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestProposalValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		giveFunc func(*Proposal)
+		wantErrs []string
+	}{
+		{
+			name: "valid",
+			giveFunc: func(*Proposal) {
+				// NOOP: All  are valid
+			},
+		},
+		{
+			name: "required fields validation",
+			giveFunc: func(p *Proposal) {
+				// Overwrite the timelock proposal with an empty one
+				*p = Proposal{
+					BaseProposal: BaseProposal{},
+				}
+			},
+			wantErrs: []string{
+				"Key: 'Proposal.BaseProposal.Version' Error:Field validation for 'Version' failed on the 'required' tag",
+				"Key: 'Proposal.BaseProposal.ValidUntil' Error:Field validation for 'ValidUntil' failed on the 'required' tag",
+				"Key: 'Proposal.BaseProposal.ChainMetadata' Error:Field validation for 'ChainMetadata' failed on the 'required' tag",
+				"Key: 'Proposal.Operations' Error:Field validation for 'Operations' failed on the 'required' tag",
+				"Key: 'Proposal.BaseProposal.Kind' Error:Field validation for 'Kind' failed on the 'required' tag",
+			},
+		},
+		{
+			name: "min validation",
+			giveFunc: func(p *Proposal) {
+				p.ChainMetadata = map[types.ChainSelector]types.ChainMetadata{}
+				p.Operations = []types.Operation{}
+			},
+			wantErrs: []string{
+				"Key: 'Proposal.BaseProposal.ChainMetadata' Error:Field validation for 'ChainMetadata' failed on the 'min' tag",
+				"Key: 'Proposal.Operations' Error:Field validation for 'Operations' failed on the 'min' tag",
+			},
+		},
+		{
+			name: "oneof validation",
+			giveFunc: func(p *Proposal) {
+				p.Version = "invalidversion"
+				p.Kind = "invalidkind"
+			},
+			wantErrs: []string{
+				"Key: 'Proposal.BaseProposal.Version' Error:Field validation for 'Version' failed on the 'oneof' tag",
+				"Key: 'Proposal.BaseProposal.Kind' Error:Field validation for 'Kind' failed on the 'oneof' tag",
+			},
+		},
+		{
+			name: "all chain selectors in transactions must be present in chain metadata",
+			giveFunc: func(p *Proposal) {
+				p.Operations[0].ChainSelector = chaintest.Chain2Selector
+			},
+			wantErrs: []string{
+				"missing metadata for chain 16015286601757825753",
+			},
+		},
+		{
+			name: "invalid chain family specific operation data (additional fields)",
+			giveFunc: func(p *Proposal) {
+				p.Operations[0].Transaction.AdditionalFields = json.RawMessage([]byte(`{"value": -100}`))
+			},
+			wantErrs: []string{
+				"invalid EVM value: -100",
+			},
+		},
+		{
+			name: "proposal has expired (validUntil)",
+			giveFunc: func(p *Proposal) {
+				p.ValidUntil = 1
+			},
+			wantErrs: []string{
+				"invalid valid until: 1",
+			},
+		},
+		{
+			name: "operations dive: required fields validation",
+			giveFunc: func(p *Proposal) {
+				p.Operations = []types.Operation{{}}
+			},
+			wantErrs: []string{
+				"Key: 'Proposal.Operations[0].ChainSelector' Error:Field validation for 'ChainSelector' failed on the 'required' tag",
+				"Key: 'Proposal.Operations[0].Transaction.To' Error:Field validation for 'To' failed on the 'required' tag",
+				"Key: 'Proposal.Operations[0].Transaction.Data' Error:Field validation for 'Data' failed on the 'required' tag",
+				"Key: 'Proposal.Operations[0].Transaction.AdditionalFields' Error:Field validation for 'AdditionalFields' failed on the 'required' tag",
+			},
+		},
+		{
+			name: "duplicate signers",
+			giveFunc: func(p *Proposal) {
+				// Two identical signatures -> same ToBytes() -> duplicate
+				p.Signatures = []types.Signature{{}, {}}
+			},
+			wantErrs: []string{
+				"duplicate signer detected: 0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// A valid proposal to be passed to the giveFunc for the test case to modify
+			proposal := Proposal{
+				BaseProposal: BaseProposal{
+					Version:    "v1",
+					Kind:       types.KindProposal,
+					ValidUntil: 2004259681,
+					Signatures: []types.Signature{},
+					ChainMetadata: map[types.ChainSelector]types.ChainMetadata{
+						chaintest.Chain1Selector: {
+							StartingOpCount: 1,
+							MCMAddress:      TestAddress,
+						},
+					},
+				},
+				Operations: []types.Operation{
+					{
+						ChainSelector: chaintest.Chain1Selector,
+						Transaction: types.Transaction{
+							To:               TestAddress,
+							AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+							Data:             common.Hex2Bytes("0x"),
+						},
+					},
+				},
+			}
+
+			tt.giveFunc(&proposal)
+
+			err := proposal.Validate()
+
+			if len(tt.wantErrs) > 0 {
+				require.Error(t, err)
+
+				var errs validator.ValidationErrors
+				if errors.As(err, &errs) {
+					assert.Len(t, errs, len(tt.wantErrs))
+
+					got := make([]string, 0, len(errs))
+					for _, e := range errs {
+						got = append(got, e.Error())
+					}
+
+					assert.ElementsMatch(t, tt.wantErrs, got)
+				} else {
+					assert.ElementsMatch(t, tt.wantErrs, []string{err.Error()})
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestProposal_GetEncoders(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		setup   func(p *Proposal)
+		want    map[types.ChainSelector]sdk.Encoder
+		wantErr string
+	}{
+		{
+			name: "success",
+			setup: func(_ *Proposal) {
+				// NOP: valid proposal.
+			},
+			want: map[types.ChainSelector]sdk.Encoder{
+				chaintest.Chain1Selector: evm.NewEncoder(chaintest.Chain1Selector, 2, false, false),
+				chaintest.Chain2Selector: evm.NewEncoder(chaintest.Chain2Selector, 1, false, false),
+			},
+		},
+		{
+			name: "failure: could not create encoder",
+			setup: func(p *Proposal) {
+				p.ChainMetadata = map[types.ChainSelector]types.ChainMetadata{
+					types.ChainSelector(0): {},
+				}
+			},
+			wantErr: "unable to create encoder: chain family not found for selector 0: unknown chain selector 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			builder := NewProposalBuilder()
+			builder.SetVersion("v1").
+				SetValidUntil(2552083725).
+				AddChainMetadata(chaintest.Chain1Selector, types.ChainMetadata{}).
+				AddChainMetadata(chaintest.Chain2Selector, types.ChainMetadata{}).
+				AddOperation(types.Operation{
+					ChainSelector: chaintest.Chain1Selector,
+					Transaction: types.Transaction{
+						To:               TestAddress,
+						AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+						Data:             common.Hex2Bytes("0x1"),
+					},
+				}).
+				AddOperation(types.Operation{
+					ChainSelector: chaintest.Chain1Selector,
+					Transaction: types.Transaction{
+						To:               TestAddress,
+						AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+						Data:             common.Hex2Bytes("0x2"),
+					},
+				}).
+				AddOperation(types.Operation{
+					ChainSelector: chaintest.Chain2Selector,
+					Transaction: types.Transaction{
+						To:               TestAddress,
+						AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+						Data:             common.Hex2Bytes("0x3"),
+					},
+				})
+
+			give, err := builder.Build()
+			tt.setup(give)
+
+			require.NoError(t, err)
+			encoders, err := give.GetEncoders()
+
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, encoders)
+			}
+		})
+	}
+}
+
+func TestProposal_UseSimulatedBackend(t *testing.T) {
+	t.Parallel()
+
+	proposal := Proposal{
+		BaseProposal: BaseProposal{},
+	}
+
+	assert.False(t, proposal.useSimulatedBackend)
+
+	proposal.UseSimulatedBackend(true)
+	assert.True(t, proposal.useSimulatedBackend)
+}
+
+func TestProposal_ChainSelectors(t *testing.T) {
+	t.Parallel()
+	builder := NewProposalBuilder()
+	builder.SetVersion("v1").
+		SetValidUntil(2552083725).
+		AddOperation(types.Operation{
+			ChainSelector: chaintest.Chain1Selector,
+			Transaction: types.Transaction{
+				To:               TestAddress,
+				AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+				Data:             common.Hex2Bytes("0x"),
+			},
+		}).
+		SetChainMetadata(map[types.ChainSelector]types.ChainMetadata{
+			chaintest.Chain1Selector: {},
+			chaintest.Chain2Selector: {},
+			chaintest.Chain3Selector: {},
+		})
+	proposal, err := builder.Build()
+	require.NoError(t, err)
+
+	// Sorted in ascending order
+	want := []types.ChainSelector{
+		chaintest.Chain1Selector,
+		chaintest.Chain3Selector,
+		chaintest.Chain2Selector,
+	}
+	assert.Equal(t, want, proposal.ChainSelectors())
+}
+
+func TestProposal_MerkleTree(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		setup    func(p *Proposal)
+		wantRoot common.Hash
+		wantErr  string
+	}{
+		{
+			name: "success: generates a merkle tree",
+			setup: func(_ *Proposal) {
+				// NOP: valid proposal.
+			},
+			wantRoot: common.HexToHash("0x4fdb98431759bbcab33cbd1b4034fea43ef360f11b1de4ca10fc20f8916bda19"),
+		},
+		{
+			name: "failure: could not get encoders",
+			setup: func(p *Proposal) {
+				p.ChainMetadata = map[types.ChainSelector]types.ChainMetadata{
+					types.ChainSelector(1): {StartingOpCount: 5},
+				}
+			},
+			wantErr: "merkle tree generation error: unable to create encoder: chain family not found for selector 1: unknown chain selector 1",
+		},
+		{
+			name: "failure: missing metadata when fetching nonces",
+			setup: func(p *Proposal) {
+				p.ChainMetadata = map[types.ChainSelector]types.ChainMetadata{
+					chaintest.Chain1Selector: {StartingOpCount: 5},
+				}
+				p.Operations = []types.Operation{
+					{ChainSelector: chaintest.Chain2Selector},
+				}
+			},
+			wantErr: "merkle tree generation error: missing metadata for chain 16015286601757825753",
+		},
+		{
+			name: "failure: nonce must be in the range of a uint32",
+			setup: func(p *Proposal) {
+				p.ChainMetadata = map[types.ChainSelector]types.ChainMetadata{
+					chaintest.Chain2Selector: {StartingOpCount: math.MaxUint32 + 1},
+					chaintest.Chain1Selector: {StartingOpCount: math.MaxUint32 + 1},
+				}
+			},
+			wantErr: "merkle tree generation error: value 4294967296 exceeds uint32 range",
+		},
+		{
+			name: "failure: could not hash operation due to invalid additional values",
+			setup: func(p *Proposal) {
+				p.Operations = []types.Operation{
+					{
+						ChainSelector: chaintest.Chain1Selector,
+						Transaction: types.Transaction{
+							AdditionalFields: json.RawMessage([]byte(``)),
+						},
+					},
+				}
+			},
+			wantErr: "merkle tree generation error: unexpected end of JSON input",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			builder := NewProposalBuilder()
+			builder.SetVersion("v1").
+				SetValidUntil(2552083725).
+				AddChainMetadata(chaintest.Chain1Selector, types.ChainMetadata{StartingOpCount: 5}).
+				AddChainMetadata(chaintest.Chain2Selector, types.ChainMetadata{StartingOpCount: 10}).
+				AddOperation(types.Operation{
+					ChainSelector: chaintest.Chain1Selector,
+					Transaction: types.Transaction{
+						To:               TestAddress,
+						AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+						Data:             common.Hex2Bytes("0x"),
+						OperationMetadata: types.OperationMetadata{
+							ContractType: "Sample contract",
+							Tags:         []string{"tag1", "tag2"},
+						},
+					},
+				}).
+				AddOperation(types.Operation{
+					ChainSelector: chaintest.Chain2Selector,
+					Transaction: types.Transaction{
+						To:               TestAddress,
+						AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+						Data:             common.Hex2Bytes("0x"),
+						OperationMetadata: types.OperationMetadata{
+							ContractType: "Sample contract",
+							Tags:         []string{"tag1", "tag2"},
+						},
+					},
+				})
+			give, err := builder.Build()
+			require.NoError(t, err)
+
+			tt.setup(give)
+
+			got, err := give.MerkleTree()
+
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.wantRoot, got.Root)
+			}
+		})
+	}
+}
+
+func TestProposal_TransactionCounts(t *testing.T) {
+	t.Parallel()
+	builder := NewProposalBuilder()
+	builder.SetVersion("v1").
+		SetValidUntil(2552083725).
+		AddChainMetadata(chaintest.Chain1Selector, types.ChainMetadata{}).
+		AddChainMetadata(chaintest.Chain2Selector, types.ChainMetadata{}).
+		SetOperations([]types.Operation{
+			{
+				ChainSelector: chaintest.Chain1Selector,
+				Transaction: types.Transaction{
+					To:               TestAddress,
+					AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+					Data:             common.Hex2Bytes("0x1"),
+				},
+			},
+			{
+				ChainSelector: chaintest.Chain1Selector,
+				Transaction: types.Transaction{
+					To:               TestAddress,
+					AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+					Data:             common.Hex2Bytes("0x2"),
+				},
+			},
+			{
+				ChainSelector: chaintest.Chain2Selector,
+				Transaction: types.Transaction{
+					To:               TestAddress,
+					AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+					Data:             common.Hex2Bytes("0x3"),
+				},
+			},
+		})
+	proposal, err := builder.Build()
+	require.NoError(t, err)
+	got := proposal.TransactionCounts()
+
+	assert.Equal(t, map[types.ChainSelector]uint64{
+		chaintest.Chain1Selector: 2,
+		chaintest.Chain2Selector: 1,
+	}, got)
+}
+
+func TestProposal_Decode(t *testing.T) {
+	t.Parallel()
+
+	// Get ABI
+	timelockAbi, err := bindings.RBACTimelockMetaData.GetAbi()
+	require.NoError(t, err)
+	exampleRole := crypto.Keccak256Hash([]byte("EXAMPLE_ROLE"))
+
+	// Grant role data
+	grantRoleData, err := timelockAbi.Pack("grantRole", [32]byte(exampleRole), common.HexToAddress("0x123"))
+	require.NoError(t, err)
+
+	tests := []struct {
+		name    string
+		setup   func(t *testing.T) (map[types.ChainSelector]sdk.Decoder, map[string]string)
+		give    []types.Operation
+		want    []sdk.DecodedOperation
+		wantErr string
+	}{
+		{
+			name: "success: decodes an operation",
+			setup: func(t *testing.T) (map[types.ChainSelector]sdk.Decoder, map[string]string) {
+				t.Helper()
+				decoders := map[types.ChainSelector]sdk.Decoder{
+					chaintest.Chain1Selector: evm.NewDecoder(),
+				}
+
+				return decoders, map[string]string{"RBACTimelock": bindings.RBACTimelockABI}
+			},
+			give: []types.Operation{
+				{
+					ChainSelector: chaintest.Chain1Selector,
+					Transaction: evm.NewTransaction(
+						common.HexToAddress("0xTestTarget"),
+						grantRoleData,
+						big.NewInt(0),
+						"RBACTimelock",
+						[]string{"grantRole"},
+					),
+				},
+			},
+			want: []sdk.DecodedOperation{
+				&evm.DecodedOperation{
+					FunctionName: "grantRole",
+					InputKeys:    []string{"role", "account"},
+					InputArgs:    []any{[32]byte(exampleRole.Bytes()), common.HexToAddress("0x0000000000000000000000000000000000000123")},
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "failure: missing chain decoder",
+			setup: func(t *testing.T) (map[types.ChainSelector]sdk.Decoder, map[string]string) {
+				t.Helper()
+				return map[types.ChainSelector]sdk.Decoder{}, map[string]string{}
+			},
+			give: []types.Operation{
+				{
+					ChainSelector: chaintest.Chain1Selector,
+					Transaction: evm.NewTransaction(
+						common.HexToAddress("0xTestTarget"),
+						grantRoleData,
+						big.NewInt(0),
+						"RBACTimelock",
+						[]string{"grantRole"},
+					),
+				},
+			},
+			want:    nil,
+			wantErr: "no decoder found for chain selector 3379446385462418246",
+		},
+		{
+			name: "failure: missing contract ABI",
+			setup: func(t *testing.T) (map[types.ChainSelector]sdk.Decoder, map[string]string) {
+				t.Helper()
+				decoders := map[types.ChainSelector]sdk.Decoder{
+					chaintest.Chain1Selector: evm.NewDecoder(),
+				}
+
+				return decoders, map[string]string{}
+			},
+			give: []types.Operation{
+				{
+					ChainSelector: chaintest.Chain1Selector,
+					Transaction: evm.NewTransaction(
+						common.HexToAddress("0xTestTarget"),
+						grantRoleData,
+						big.NewInt(0),
+						"RBACTimelock",
+						[]string{"grantRole"},
+					),
+				},
+			},
+			want:    nil,
+			wantErr: "no contract interfaces found for contract type RBACTimelock",
+		},
+		{
+			name: "failure: unable to decode operation",
+			setup: func(t *testing.T) (map[types.ChainSelector]sdk.Decoder, map[string]string) {
+				t.Helper()
+				mockDecoder := mocks.NewDecoder(t)
+				mockDecoder.EXPECT().Decode(mock.Anything, mock.Anything).Return(nil, errors.New("decode error"))
+				decoders := map[types.ChainSelector]sdk.Decoder{
+					chaintest.Chain1Selector: mockDecoder,
+				}
+
+				return decoders, map[string]string{"RBACTimelock": bindings.RBACTimelockABI}
+			},
+			give: []types.Operation{
+				{
+					ChainSelector: chaintest.Chain1Selector,
+					Transaction: evm.NewTransaction(
+						common.HexToAddress("0xTestTarget"),
+						grantRoleData,
+						big.NewInt(0),
+						"RBACTimelock",
+						[]string{"grantRole"},
+					),
+				},
+			},
+			want:    nil,
+			wantErr: "unable to decode operation: decode error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			proposal := Proposal{
+				BaseProposal: BaseProposal{},
+				Operations:   tt.give,
+			}
+
+			decoders, interfaces := tt.setup(t)
+			got, err := proposal.Decode(decoders, interfaces)
+
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestProposal_TransactionNonces(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		setup   func(b *Proposal)
+		want    []uint64
+		wantErr string
+	}{
+		{
+			name: "success: returns the nonces for each transaction",
+			setup: func(b *Proposal) {
+				// NOP: valid proposal.
+			},
+			want: []uint64{5, 10, 6, 11, 7},
+		},
+		{
+			name: "failure: chain metadata not found for transaction",
+			setup: func(p *Proposal) {
+				p.ChainMetadata = map[types.ChainSelector]types.ChainMetadata{
+					chaintest.Chain1Selector: {StartingOpCount: 5},
+				}
+				p.Operations = []types.Operation{
+					{ChainSelector: chaintest.Chain2Selector},
+				}
+			},
+			wantErr: "missing metadata for chain 16015286601757825753",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			builder := NewProposalBuilder()
+			builder.SetVersion("v1").
+				SetValidUntil(2552083725).
+				AddChainMetadata(chaintest.Chain1Selector, types.ChainMetadata{StartingOpCount: 5}).
+				AddChainMetadata(chaintest.Chain2Selector, types.ChainMetadata{StartingOpCount: 10}).
+				AddChainMetadata(chaintest.Chain3Selector, types.ChainMetadata{StartingOpCount: 15}).
+				SetOperations([]types.Operation{
+					{
+						ChainSelector: chaintest.Chain1Selector,
+						Transaction: types.Transaction{
+							To:               TestAddress,
+							AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+							Data:             common.Hex2Bytes("0x1"),
+						},
+					},
+					{
+						ChainSelector: chaintest.Chain2Selector,
+						Transaction: types.Transaction{
+							To:               TestAddress,
+							AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+							Data:             common.Hex2Bytes("0x1"),
+						},
+					},
+					{
+						ChainSelector: chaintest.Chain1Selector,
+						Transaction: types.Transaction{
+							To:               TestAddress,
+							AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+							Data:             common.Hex2Bytes("0x2"),
+						},
+					},
+					{
+						ChainSelector: chaintest.Chain2Selector,
+						Transaction: types.Transaction{
+							To:               TestAddress,
+							AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+							Data:             common.Hex2Bytes("0x2"),
+						},
+					},
+					{
+						ChainSelector: chaintest.Chain1Selector,
+						Transaction: types.Transaction{
+							To:               TestAddress,
+							AdditionalFields: json.RawMessage([]byte(`{"value": 0}`)),
+							Data:             common.Hex2Bytes("0x1"),
+						},
+					},
+				})
+			give, err := builder.Build()
+			require.NoError(t, err)
+
+			tt.setup(give)
+			got, err := give.TransactionNonces()
+
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+// newSignedProposal is a test helper that builds a minimal valid proposal and signs it with
+// the given private keys.
+func newSignedProposal(t *testing.T, keys []*ecdsa.PrivateKey) *Proposal {
+	t.Helper()
+
+	builder := NewProposalBuilder()
+	builder.SetVersion("v1").
+		SetValidUntil(2004259681).
+		AddChainMetadata(chaintest.Chain1Selector, types.ChainMetadata{}).
+		AddOperation(types.Operation{
+			ChainSelector: chaintest.Chain1Selector,
+			Transaction: types.Transaction{
+				To:               TestAddress,
+				AdditionalFields: json.RawMessage(`{"value": 0}`),
+				Data:             common.Hex2Bytes("0x1"),
+			},
+		})
+
+	proposal, err := builder.Build()
+	require.NoError(t, err)
+
+	signable, err := NewSignable(proposal, nil)
+	require.NoError(t, err)
+
+	for _, key := range keys {
+		_, err = signable.SignAndAppend(NewPrivateKeySigner(key))
+		require.NoError(t, err)
+	}
+
+	return proposal
+}
+
+func TestProposal_EvaluateSignatures(t *testing.T) {
+	t.Parallel()
+
+	key1, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	key2, err := crypto.GenerateKey()
+	require.NoError(t, err)
+
+	addr1 := crypto.PubkeyToAddress(key1.PublicKey)
+	addr2 := crypto.PubkeyToAddress(key2.PublicKey)
+
+	tests := []struct {
+		name               string
+		signerKeys         []*ecdsa.PrivateKey
+		appendBadSignature bool
+		wantRecovered      []common.Address
+		wantFailuresLen    int
+		wantFailureIndex   int // only checked when wantFailuresLen > 0
+	}{
+		{
+			name:            "success: all signatures recoverable",
+			signerKeys:      []*ecdsa.PrivateKey{key1, key2},
+			wantRecovered:   []common.Address{addr1, addr2},
+			wantFailuresLen: 0,
+		},
+		{
+			name:               "success: some signatures unrecoverable",
+			signerKeys:         []*ecdsa.PrivateKey{key1},
+			appendBadSignature: true,
+			wantRecovered:      []common.Address{addr1},
+			wantFailuresLen:    1,
+			wantFailureIndex:   1,
+		},
+		{
+			name:            "success: no signatures",
+			wantRecovered:   []common.Address{},
+			wantFailuresLen: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			proposal := newSignedProposal(t, tt.signerKeys)
+			if tt.appendBadSignature {
+				proposal.Signatures = append(proposal.Signatures, types.Signature{R: common.Hash{}, S: common.Hash{}, V: 0})
+			}
+
+			recovered, failures, err := proposal.RecoverSigningAddresses()
+
+			require.NoError(t, err)
+			assert.Len(t, failures, tt.wantFailuresLen)
+			if tt.wantFailuresLen > 0 {
+				assert.Equal(t, tt.wantFailureIndex, failures[0].Index)
+			}
+			assert.ElementsMatch(t, tt.wantRecovered, recovered)
+		})
+	}
+}
+
+func TestProposal_AddressesFromSignaturesStrict(t *testing.T) {
+	t.Parallel()
+
+	key1, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	key2, err := crypto.GenerateKey()
+	require.NoError(t, err)
+
+	addr1 := crypto.PubkeyToAddress(key1.PublicKey)
+	addr2 := crypto.PubkeyToAddress(key2.PublicKey)
+
+	tests := []struct {
+		name               string
+		signerKeys         []*ecdsa.PrivateKey
+		appendBadSignature bool
+		wantErr            bool
+		wantSigErrIndex    int
+		want               []common.Address
+	}{
+		{
+			name:       "success: all signatures recoverable",
+			signerKeys: []*ecdsa.PrivateKey{key1, key2},
+			want:       []common.Address{addr1, addr2},
+		},
+		{
+			name:               "error: unrecoverable signature returns InvalidSignatureAtIndexError",
+			signerKeys:         []*ecdsa.PrivateKey{key1},
+			appendBadSignature: true,
+			wantErr:            true,
+			wantSigErrIndex:    1,
+		},
+		{
+			name: "success: no signatures returns empty slice",
+			want: []common.Address{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			proposal := newSignedProposal(t, tt.signerKeys)
+			if tt.appendBadSignature {
+				proposal.Signatures = append(proposal.Signatures, types.Signature{R: common.Hash{}, S: common.Hash{}, V: 0})
+			}
+
+			recovered, err := proposal.RecoverSigningAddressesStrict()
+
+			if tt.wantErr {
+				require.Nil(t, recovered)
+				var sigErr *InvalidSignatureAtIndexError
+				require.ErrorAs(t, err, &sigErr)
+				assert.Equal(t, tt.wantSigErrIndex, sigErr.Index)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.ElementsMatch(t, tt.want, recovered)
+		})
+	}
+}

@@ -1,0 +1,205 @@
+package evm
+
+import (
+	"context"
+	"encoding/json"
+	"math/big"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	chainsel "github.com/smartcontractkit/chain-selectors"
+
+	"github.com/ethereum/go-ethereum/common"
+
+	sdkerrors "github.com/smartcontractkit/mcms/sdk/errors"
+	"github.com/smartcontractkit/mcms/types"
+)
+
+func TestTimelockConverter_ConvertBatchToChainOperation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	timelockAddress := "0x1234567890123456789012345678901234567890"
+	mcmAddress := "0x9876543210987654321098765432109876543210"
+	zeroHash := common.Hash{}
+	testCases := []struct {
+		name           string
+		metadata       types.ChainMetadata
+		op             types.BatchOperation
+		delay          string
+		operation      types.TimelockAction
+		predecessor    common.Hash
+		salt           common.Hash
+		expectedError  string
+		expectedOpType string
+	}{
+		{
+			name: "Schedule operation",
+			op: types.BatchOperation{
+				Transactions: []types.Transaction{
+					NewTransaction(
+						common.HexToAddress("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+						[]byte("data"),
+						big.NewInt(1000),
+						"RBACTimelock",
+						[]string{"tag1", "tag2"},
+					),
+				},
+				ChainSelector: types.ChainSelector(chainsel.ETHEREUM_TESTNET_SEPOLIA.Selector),
+			},
+			delay:          "1h",
+			operation:      types.TimelockActionSchedule,
+			predecessor:    zeroHash,
+			salt:           zeroHash,
+			expectedOpType: "RBACTimelock",
+		},
+		{
+			name: "Cancel operation",
+			op: types.BatchOperation{
+				Transactions: []types.Transaction{
+					NewTransaction(
+						common.HexToAddress("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+						[]byte("data"),
+						big.NewInt(1000),
+						"RBACTimelock",
+						[]string{"tag1", "tag2"},
+					),
+				},
+				ChainSelector: types.ChainSelector(chainsel.ETHEREUM_TESTNET_SEPOLIA.Selector),
+			},
+			delay:          "1h",
+			operation:      types.TimelockActionCancel,
+			predecessor:    zeroHash,
+			salt:           zeroHash,
+			expectedOpType: "RBACTimelock",
+		},
+		{
+			name: "Invalid operation",
+			op: types.BatchOperation{
+				Transactions: []types.Transaction{
+					NewTransaction(
+						common.HexToAddress("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+						[]byte("data"),
+						big.NewInt(1000),
+						"RBACTimelock",
+						[]string{"tag1", "tag2"},
+					),
+				},
+				ChainSelector: types.ChainSelector(chainsel.ETHEREUM_TESTNET_SEPOLIA.Selector),
+			},
+			delay:          "1h",
+			operation:      types.TimelockAction("invalid"),
+			predecessor:    zeroHash,
+			salt:           zeroHash,
+			expectedError:  sdkerrors.NewInvalidTimelockOperationError("invalid").Error(),
+			expectedOpType: "",
+		},
+		{
+			name: "Invalid additional fields",
+			op: types.BatchOperation{
+				Transactions: []types.Transaction{{
+					OperationMetadata: types.OperationMetadata{ContractType: "RBACTimelock"},
+					To:                timelockAddress,
+					Data:              []byte("0x1234"),
+					AdditionalFields:  []byte("invalid"),
+				}},
+				ChainSelector: types.ChainSelector(chainsel.ETHEREUM_TESTNET_SEPOLIA.Selector),
+			},
+			delay:         "1h",
+			operation:     types.TimelockActionSchedule,
+			predecessor:   zeroHash,
+			salt:          zeroHash,
+			expectedError: "failed to unmarshal EVM additional fields: invalid character 'i' looking for beginning of value",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			converter := &TimelockConverter{}
+			chainOperations, operationID, err := converter.ConvertBatchToChainOperations(
+				ctx,
+				tc.metadata,
+				tc.op,
+				timelockAddress,
+				mcmAddress,
+				types.MustParseDuration(tc.delay),
+				tc.operation,
+				tc.predecessor,
+				tc.salt,
+			)
+
+			if tc.expectedError != "" {
+				require.Error(t, err)
+				require.EqualError(t, err, tc.expectedError)
+			} else {
+				require.NoError(t, err)
+				require.NotEqual(t, common.Hash{}, operationID)
+				require.Len(t, chainOperations, 1)
+				require.Equal(t, timelockAddress, chainOperations[0].Transaction.To)
+				require.Equal(t, tc.op.ChainSelector, chainOperations[0].ChainSelector)
+			}
+		})
+	}
+}
+
+func TestOperationID(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		batchOp     types.BatchOperation
+		action      types.TimelockAction
+		predecessor common.Hash
+		salt        common.Hash
+		want        common.Hash
+		wantErr     string
+	}{
+		{
+			name: "success",
+			batchOp: types.BatchOperation{
+				ChainSelector: types.ChainSelector(chainsel.ETHEREUM_TESTNET_SEPOLIA.Selector),
+				Transactions: []types.Transaction{{
+					To:               "0x456",
+					Data:             []byte("data"),
+					AdditionalFields: json.RawMessage(`{"value": 1000}`),
+				}},
+			},
+			action:      types.TimelockActionSchedule,
+			predecessor: common.HexToHash("0x0123"),
+			salt:        common.HexToHash("0xabcd"),
+			want:        common.HexToHash("0xcffb730ae9a09232d2ef7754aaa9b0990d6eb7689e1cc4ef812f0db9f9e1beef"),
+		},
+		{
+			name: "failure: bad additional fields",
+			batchOp: types.BatchOperation{
+				ChainSelector: types.ChainSelector(chainsel.ETHEREUM_TESTNET_SEPOLIA.Selector),
+				Transactions: []types.Transaction{{
+					To:               "0x456",
+					Data:             []byte("data"),
+					AdditionalFields: json.RawMessage(`invalid`),
+				}},
+			},
+			action:      types.TimelockActionSchedule,
+			predecessor: common.HexToHash("0x0123"),
+			salt:        common.HexToHash("0xabcd"),
+			wantErr:     "failed to unmarshal EVM additional fields: invalid character 'i'",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			operationID, err := OperationID(tt.batchOp, tt.action, tt.predecessor, tt.salt)
+
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				require.Equal(t, tt.want, operationID)
+			} else {
+				require.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
+}

@@ -1,0 +1,59 @@
+name: pull-request-main-nix
+
+on:
+  merge_group:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  ci-test-e2e:
+    name: Tests E2E - Nix setup
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - name: Install Nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Build TON contracts
+        id: ton-contracts-build
+        shell: bash
+        run: |
+          PATH_CONTRACTS_TON_PKG="$(nix build .#chainlink-ton-contracts --print-out-paths)/"
+          PATH_CONTRACTS_TON="$PATH_CONTRACTS_TON_PKG/lib/node_modules/@chainlink/contracts-ton/build/"
+          echo "path=$PATH_CONTRACTS_TON" >> "$GITHUB_OUTPUT"
+
+      - name: Run e2e tests
+        uses: smartcontractkit/.github/actions/ci-test-go@ci-test-go/v1
+        with:
+          checkout-repo: false
+          use-go-cache: true
+          go-test-cmd: |
+            set +e
+
+            echo "::group::TON"
+            export PATH_CONTRACTS_TON="${{ steps.ton-contracts-build.outputs.path }}"
+            CTF_CONFIGS=../config.ton.toml go test -p=1 -tags=e2e -v ./e2e/tests/... -run=TestTONSuite || ton_failure=true
+            echo "::endgroup::"
+
+            [[ -n "${ton_failure}" ]] && echo "🚨 TON e2e tests failed."
+            [[ -n "${ton_failure}" ]] && {
+              exit 1
+            } || {
+              echo "Exiting"
+              exit 0
+            }
